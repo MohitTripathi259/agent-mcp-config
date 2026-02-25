@@ -29,6 +29,55 @@ from . import Transport
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_BUFFER_SIZE = 1024 * 1024  # 1MB buffer limit
+
+
+def _resolve_bat_command(bat_path: str) -> list[str] | None:
+    """Parse a Windows .bat/.cmd file to extract the underlying executable command.
+
+    Handles the common pattern used by Node.js wrappers:
+        "C:\\path\\to\\node.exe" "C:\\path\\to\\script.js" %*
+
+    Returns a list like ['node.exe path', 'cli.js path'] with %* stripped,
+    or None if parsing fails.
+    """
+    try:
+        with open(bat_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip()
+                # Skip blank lines, @echo directives, and REM comments
+                if not stripped:
+                    continue
+                lower = stripped.lower()
+                if lower.startswith("@") or lower.startswith("rem ") or lower == "rem":
+                    continue
+                # Remove %* argument passthrough placeholder
+                base_cmd = stripped.replace("%*", "").strip()
+                if not base_cmd:
+                    continue
+                # Parse Windows-style double-quoted tokens
+                parts: list[str] = []
+                in_quote = False
+                current: list[str] = []
+                for ch in base_cmd:
+                    if ch == '"':
+                        in_quote = not in_quote
+                    elif not in_quote and ch == " ":
+                        token = "".join(current).strip()
+                        if token:
+                            parts.append(token)
+                        current = []
+                    else:
+                        current.append(ch)
+                token = "".join(current).strip()
+                if token:
+                    parts.append(token)
+                if parts:
+                    return parts
+    except Exception as exc:
+        logger.debug(f"_resolve_bat_command failed for '{bat_path}': {exc}")
+    return None
+
+
 MINIMUM_CLAUDE_CODE_VERSION = "2.0.0"
 
 # Platform-specific command line length limits
@@ -282,6 +331,24 @@ class SubprocessCLITransport(Transport):
             await self._check_claude_version()
 
         cmd = self._build_command()
+
+        # On Windows, anyio cannot directly execute .bat/.cmd files via CreateProcess.
+        # Parse the .bat file to extract the underlying executable (e.g., node.exe + cli.js)
+        # and call it directly. This avoids cmd.exe's newline-handling issues when args
+        # (like --system-prompt) contain embedded newlines.
+        if platform.system() == "Windows" and cmd and str(cmd[0]).lower().endswith((".bat", ".cmd")):
+            bat_path = str(cmd[0])
+            base_cmd = _resolve_bat_command(bat_path)
+            if base_cmd:
+                # Replace the .bat entry point with the actual exe + script
+                cmd = base_cmd + list(cmd[1:])
+            else:
+                logger.warning(
+                    f"Could not parse .bat file '{bat_path}'; "
+                    "falling back to cmd.exe /c (may fail if args contain newlines)"
+                )
+                cmd = ["cmd.exe", "/c"] + cmd
+
         try:
             # Merge environment variables: system -> user -> SDK required
             process_env = {

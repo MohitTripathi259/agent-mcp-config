@@ -30,6 +30,11 @@ logger = logging.getLogger("AGENT")
 # Project root (where .claude/settings.json lives)
 project_root = str(Path(__file__).parent)
 
+# On Windows, the claude.cmd wrapper breaks when the username contains special
+# characters like parentheses. We use a wrapper batch file at a safe path.
+# Wrapper at C:\Users\Public\claude_run.bat calls node.exe with cli.js directly.
+CLAUDE_CLI_PATH = r"C:\Users\Public\claude_run.bat"
+
 # Tools allowed for this agent (must match tool names exposed by MCP servers)
 ALLOWED_TOOLS = ["send_email"]
 
@@ -69,6 +74,11 @@ async def run_agent(query: str, max_turns: int = 10) -> Dict[str, Any]:
         permission_mode="bypassPermissions",
         system_prompt=SYSTEM_PROMPT,
         max_turns=max_turns,
+        # Windows fix: bypass claude.cmd (breaks on usernames with parentheses)
+        # Uses C:\Users\Public\claude_run.bat which calls node + cli.js with proper quoting
+        cli_path=CLAUDE_CLI_PATH,
+        # Unset CLAUDECODE so the subprocess doesn't think it's nested inside Claude Code
+        env={"CLAUDECODE": ""},
     )
 
     # ── ClaudeSDKClient ──────────────────────────────────────────────────────
