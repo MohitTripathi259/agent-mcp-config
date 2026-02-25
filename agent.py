@@ -1,151 +1,99 @@
 """
 agent.py
 --------
-Claude Agent using ClaudeAgentOptions + ClaudeSDKClient.
+Email agent using Anthropic API directly + MCP HTTP server for send_email tool.
 
-Connects to MCP servers defined in .claude/settings.json via setting_sources=["project"].
-The email MCP server (App Runner) is discovered automatically from settings.json.
+Flow: run_agent(prompt) → Anthropic API (tool loop) → MCP HTTP server → SES
 """
 
-import os
-import sys
+import json
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
+import httpx
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from claude_agent_sdk import (
-    ClaudeSDKClient,
-    ClaudeAgentOptions,
-    AssistantMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolUseBlock,
-    ToolResultBlock,
-    ResultMessage,
-)
-
 logger = logging.getLogger("AGENT")
 
-# Project root (where mcp_http_proxy.py lives)
-project_root = str(Path(__file__).parent)
-
-# Proxy script that bridges Claude CLI stdio ↔ HTTP MCP server.
-# Root cause: Claude CLI's HTTP MCP transport fails on the `initialized`
-# notification because the App Runner server incorrectly returns an error
-# response for notifications. The stdio proxy suppresses those responses.
-MCP_PROXY_SCRIPT = str(Path(__file__).parent / "mcp_http_proxy.py")
 MCP_SERVER_URL = "https://hm7z9pivmn.us-west-2.awsapprunner.com"
 
-# On Windows, the claude.cmd wrapper breaks when the username contains special
-# characters like parentheses. We use a wrapper batch file at a safe path.
-# Wrapper at C:\Users\Public\claude_run.bat calls node.exe with cli.js directly.
-CLAUDE_CLI_PATH = r"C:\Users\Public\claude_run.bat"
 
-# Tools allowed for this agent (must match tool names exposed by MCP servers)
-ALLOWED_TOOLS = ["send_email"]
+def _get_tools() -> List[Dict]:
+    """Fetch available tools from the MCP server."""
+    with httpx.Client(timeout=15) as client:
+        resp = client.post(MCP_SERVER_URL, json={
+            "jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1
+        })
+        resp.raise_for_status()
+        tools = resp.json().get("result", {}).get("tools", [])
+    return [
+        {
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "input_schema": t.get("inputSchema", {"type": "object", "properties": {}}),
+        }
+        for t in tools
+    ]
 
-# System prompt
-SYSTEM_PROMPT = """You are a helpful AI agent with access to MCP tools.
 
-Available tools come from MCP servers configured in .claude/settings.json.
+def _call_tool(tool_name: str, arguments: Dict) -> str:
+    """Call a tool on the MCP server and return the text result."""
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(MCP_SERVER_URL, json={
+            "jsonrpc": "2.0", "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments}, "id": 1
+        })
+        resp.raise_for_status()
+        content = resp.json().get("result", {}).get("content", [])
+        return content[0].get("text", str(content)) if content else ""
 
-Use tools when needed to complete the user's request.
-Always confirm success or failure clearly in your response."""
 
-
-async def run_agent(query: str, max_turns: int = 10) -> Dict[str, Any]:
+async def run_agent(prompt: str, max_turns: int = 10) -> Dict[str, Any]:
     """
-    Run the agent on a query using ClaudeAgentOptions + ClaudeSDKClient.
+    Run the agent on a prompt.
 
-    This is the same pattern used across all agents in this codebase:
-      1. Build ClaudeAgentOptions (model, MCP servers, tools, system prompt)
-      2. Create ClaudeSDKClient with those options
-      3. Connect → query → stream response
-
-    Args:
-        query: The user's prompt
-        max_turns: Max agent turns
-
-    Returns:
-        Dict with response, tools_used, turns, cost
+    Uses Anthropic API directly with an agentic tool-use loop.
+    MCP tools are discovered from the HTTP MCP server and called over HTTP.
     """
+    tools = _get_tools()
+    logger.info(f"Tools: {[t['name'] for t in tools]}")
 
-    # ── ClaudeAgentOptions ──────────────────────────────────────────────────
-    # We pass the MCP server as a stdio proxy instead of using Claude CLI's
-    # HTTP transport. Root cause: the App Runner server returns JSON-RPC error
-    # responses for `initialized` notifications, which Claude CLI's HTTP
-    # transport interprets as a connection failure. The stdio proxy correctly
-    # suppresses responses to notifications, so MCP init succeeds.
-    options = ClaudeAgentOptions(
-        cwd=project_root,
-        setting_sources=[],                   # don't read settings files
-        mcp_servers={
-            "email": {
-                "type": "stdio",
-                "command": sys.executable,    # current Python interpreter
-                "args": [MCP_PROXY_SCRIPT, MCP_SERVER_URL],
-            }
-        },
-        allowed_tools=ALLOWED_TOOLS,
-        permission_mode="bypassPermissions",
-        system_prompt=SYSTEM_PROMPT,
-        max_turns=max_turns,
-        # Windows fix: bypass claude.cmd (breaks on usernames with parentheses)
-        # Uses C:\Users\Public\claude_run.bat which calls node + cli.js with proper quoting
-        cli_path=CLAUDE_CLI_PATH,
-        # Unset CLAUDECODE so the subprocess doesn't think it's nested inside Claude Code
-        env={"CLAUDECODE": ""},
-    )
-
-    # ── ClaudeSDKClient ──────────────────────────────────────────────────────
-    client = ClaudeSDKClient(options=options)
-
-    response_text = ""
+    client = anthropic.AsyncAnthropic()
+    messages = [{"role": "user", "content": prompt}]
     tools_used: List[str] = []
-    turns = 0
-    cost = 0.0
+    response_text = ""
 
-    logger.info(f"[AGENT] Connecting to Claude SDK...")
-    await client.__aenter__()
+    for turn in range(max_turns):
+        logger.info(f"Turn {turn + 1}")
+        resp = await client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            system="You are a helpful AI agent. Use the available tools to complete the user's request.",
+            messages=messages,
+            tools=tools,
+        )
 
-    try:
-        logger.info(f"[AGENT] Sending query: {query[:100]}...")
-        await client.query(query)
+        if resp.stop_reason == "end_turn":
+            response_text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+            break
 
-        # Stream messages until ResultMessage
-        async for message in client.receive_response():
+        if resp.stop_reason == "tool_use":
+            tool_results = []
+            for block in resp.content:
+                if block.type == "tool_use":
+                    tools_used.append(block.name)
+                    logger.info(f"Tool call: {block.name} | args={block.input}")
+                    result = _call_tool(block.name, block.input)
+                    logger.info(f"Tool result: {result}")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            messages.append({"role": "assistant", "content": resp.content})
+            messages.append({"role": "user", "content": tool_results})
 
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response_text += block.text
-                        logger.info(f"[AGENT] Text: {block.text[:100]}...")
-                    elif isinstance(block, ThinkingBlock):
-                        logger.info(f"[AGENT] Thinking: {block.thinking[:80]}...")
-                    elif isinstance(block, ToolUseBlock):
-                        tools_used.append(block.name)
-                        logger.info(f"[AGENT] Tool call: {block.name} | input={block.input}")
-                    elif isinstance(block, ToolResultBlock):
-                        logger.info(f"[AGENT] Tool result: {block.content}")
-
-            elif isinstance(message, ResultMessage):
-                turns = message.num_turns
-                cost = message.total_cost_usd or 0.0
-                logger.info(f"[AGENT] Done — turns={turns}, cost=${cost:.4f}")
-
-        # tools_used is populated directly from ToolUseBlock messages above
-
-    finally:
-        logger.info("[AGENT] Closing connection...")
-        await client.__aexit__(None, None, None)
-
-    return {
-        "response": response_text,
-        "tools_used": tools_used,
-        "turns": turns,
-        "cost_usd": cost,
-    }
+    return {"response": response_text, "tools_used": tools_used, "turns": turn + 1}
