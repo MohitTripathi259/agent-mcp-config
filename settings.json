@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    
+    "email": {
+      "httpUrl": "https://hm7z9pivmn.us-west-2.awsapprunner.com",
+      "authProviderType": "none",
+      "description": "Email tool - sends emails via API to reciever email address",
+      "enabled": true
+    }
+  }
+}
