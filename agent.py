@@ -8,6 +8,7 @@ The email MCP server (App Runner) is discovered automatically from settings.json
 """
 
 import os
+import sys
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,13 +23,22 @@ from claude_agent_sdk import (
     AssistantMessage,
     TextBlock,
     ThinkingBlock,
+    ToolUseBlock,
+    ToolResultBlock,
     ResultMessage,
 )
 
 logger = logging.getLogger("AGENT")
 
-# Project root (where .claude/settings.json lives)
+# Project root (where mcp_http_proxy.py lives)
 project_root = str(Path(__file__).parent)
+
+# Proxy script that bridges Claude CLI stdio ↔ HTTP MCP server.
+# Root cause: Claude CLI's HTTP MCP transport fails on the `initialized`
+# notification because the App Runner server incorrectly returns an error
+# response for notifications. The stdio proxy suppresses those responses.
+MCP_PROXY_SCRIPT = str(Path(__file__).parent / "mcp_http_proxy.py")
+MCP_SERVER_URL = "https://hm7z9pivmn.us-west-2.awsapprunner.com"
 
 # On Windows, the claude.cmd wrapper breaks when the username contains special
 # characters like parentheses. We use a wrapper batch file at a safe path.
@@ -65,11 +75,21 @@ async def run_agent(query: str, max_turns: int = 10) -> Dict[str, Any]:
     """
 
     # ── ClaudeAgentOptions ──────────────────────────────────────────────────
-    # setting_sources=["project"] tells Claude Code to read .claude/settings.json
-    # from the project root, which contains our email MCP server URL.
+    # We pass the MCP server as a stdio proxy instead of using Claude CLI's
+    # HTTP transport. Root cause: the App Runner server returns JSON-RPC error
+    # responses for `initialized` notifications, which Claude CLI's HTTP
+    # transport interprets as a connection failure. The stdio proxy correctly
+    # suppresses responses to notifications, so MCP init succeeds.
     options = ClaudeAgentOptions(
         cwd=project_root,
-        setting_sources=["project"],          # reads .claude/settings.json
+        setting_sources=[],                   # don't read settings files
+        mcp_servers={
+            "email": {
+                "type": "stdio",
+                "command": sys.executable,    # current Python interpreter
+                "args": [MCP_PROXY_SCRIPT, MCP_SERVER_URL],
+            }
+        },
         allowed_tools=ALLOWED_TOOLS,
         permission_mode="bypassPermissions",
         system_prompt=SYSTEM_PROMPT,
@@ -106,16 +126,18 @@ async def run_agent(query: str, max_turns: int = 10) -> Dict[str, Any]:
                         logger.info(f"[AGENT] Text: {block.text[:100]}...")
                     elif isinstance(block, ThinkingBlock):
                         logger.info(f"[AGENT] Thinking: {block.thinking[:80]}...")
+                    elif isinstance(block, ToolUseBlock):
+                        tools_used.append(block.name)
+                        logger.info(f"[AGENT] Tool call: {block.name} | input={block.input}")
+                    elif isinstance(block, ToolResultBlock):
+                        logger.info(f"[AGENT] Tool result: {block.content}")
 
             elif isinstance(message, ResultMessage):
                 turns = message.num_turns
                 cost = message.total_cost_usd or 0.0
                 logger.info(f"[AGENT] Done — turns={turns}, cost=${cost:.4f}")
 
-        # Collect tool names from session (ResultMessage doesn't expose them directly,
-        # so we log what was used from the response text heuristically)
-        if "send_email" in response_text.lower() or "email" in response_text.lower():
-            tools_used = ["send_email"]
+        # tools_used is populated directly from ToolUseBlock messages above
 
     finally:
         logger.info("[AGENT] Closing connection...")

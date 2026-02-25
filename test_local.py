@@ -43,8 +43,12 @@ def load_mcp_servers(settings_path: str = ".claude/settings.json") -> Dict[str, 
     config = json.loads(path.read_text())
     servers = {}
     for name, cfg in config.get("mcpServers", {}).items():
-        if cfg.get("enabled", True) and cfg.get("httpUrl"):
-            servers[name] = cfg["httpUrl"]
+        if not cfg.get("enabled", True):
+            continue
+        # Support both legacy httpUrl and standard Claude CLI url field
+        url = cfg.get("httpUrl") or cfg.get("url")
+        if url:
+            servers[name] = url
     return servers
 
 
