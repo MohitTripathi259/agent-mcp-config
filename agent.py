@@ -1,99 +1,156 @@
 """
 agent.py
 --------
-Email agent using Anthropic API directly + MCP HTTP server for send_email tool.
+Email agent using ClaudeAgentOptions + ClaudeSDKClient (SDK MCP server pattern).
 
-Flow: run_agent(prompt) → Anthropic API (tool loop) → MCP HTTP server → SES
+The send_email tool runs in-process via create_sdk_mcp_server(), which calls
+the App Runner HTTP endpoint. This matches the pattern used in other agents
+(CI-agent, scout-lambda) and avoids Claude CLI's HTTP MCP transport issues.
+
+Flow: run_agent(prompt)
+        → ClaudeAgentOptions (sdk MCP server in-process)
+        → ClaudeSDKClient
+        → Claude CLI subprocess
+        → mcp__email__send_email tool
+        → App Runner HTTP → SES → Email
 """
 
-import json
+import sys
 import logging
+from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    AssistantMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+    ToolResultBlock,
+    ResultMessage,
+    tool,
+    create_sdk_mcp_server,
+)
+
 logger = logging.getLogger("AGENT")
 
-MCP_SERVER_URL = "https://hm7z9pivmn.us-west-2.awsapprunner.com"
+# ── Constants ────────────────────────────────────────────────────────────────
+
+project_root    = str(Path(__file__).parent)
+MCP_SERVER_URL  = "https://hm7z9pivmn.us-west-2.awsapprunner.com"
+CLAUDE_CLI_PATH = r"C:\Users\Public\claude_run.bat"   # Windows: bypasses claude.cmd
+
+SYSTEM_PROMPT = (
+    "You are a helpful AI agent with access to an email tool. "
+    "Use the send_email tool to send emails as requested. "
+    "Always confirm success or failure clearly in your response."
+)
 
 
-def _get_tools() -> List[Dict]:
-    """Fetch available tools from the MCP server."""
-    with httpx.Client(timeout=15) as client:
-        resp = client.post(MCP_SERVER_URL, json={
-            "jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1
-        })
-        resp.raise_for_status()
-        tools = resp.json().get("result", {}).get("tools", [])
-    return [
-        {
-            "name": t["name"],
-            "description": t.get("description", ""),
-            "input_schema": t.get("inputSchema", {"type": "object", "properties": {}}),
-        }
-        for t in tools
-    ]
+# ── In-process MCP tool ──────────────────────────────────────────────────────
 
-
-def _call_tool(tool_name: str, arguments: Dict) -> str:
-    """Call a tool on the MCP server and return the text result."""
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(MCP_SERVER_URL, json={
-            "jsonrpc": "2.0", "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments}, "id": 1
+@tool(
+    name="send_email",
+    description=(
+        "Send an email via SES. Both to_email and from_email must be "
+        "SES-verified addresses."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "to_email":   {"type": "string", "description": "Recipient (SES-verified)"},
+            "from_email": {"type": "string", "description": "Sender (SES-verified)"},
+            "subject":    {"type": "string", "description": "Email subject"},
+            "content":    {"type": "string", "description": "Email body (HTML supported)"},
+        },
+        "required": ["to_email", "from_email", "subject", "content"],
+    },
+)
+async def send_email(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Call the App Runner MCP HTTP endpoint to send an email via SES."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(MCP_SERVER_URL, json={
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "send_email", "arguments": args},
+            "id": 1,
         })
         resp.raise_for_status()
         content = resp.json().get("result", {}).get("content", [])
-        return content[0].get("text", str(content)) if content else ""
+        text = content[0].get("text", str(content)) if content else "done"
+    return {"content": [{"type": "text", "text": text}]}
 
+
+EMAIL_MCP_SERVER = create_sdk_mcp_server(name="email", tools=[send_email])
+ALLOWED_TOOLS    = ["mcp__email__send_email"]
+
+
+# ── Agent runner ─────────────────────────────────────────────────────────────
 
 async def run_agent(prompt: str, max_turns: int = 10) -> Dict[str, Any]:
     """
-    Run the agent on a prompt.
+    Run the agent using ClaudeAgentOptions + ClaudeSDKClient.
 
-    Uses Anthropic API directly with an agentic tool-use loop.
-    MCP tools are discovered from the HTTP MCP server and called over HTTP.
+    Pattern mirrors other agents in this codebase (CI-agent, scout-lambda):
+      1. Build ClaudeAgentOptions with in-process SDK MCP server
+      2. Create ClaudeSDKClient
+      3. connect → query → stream response
     """
-    tools = _get_tools()
-    logger.info(f"Tools: {[t['name'] for t in tools]}")
+    options = ClaudeAgentOptions(
+        cwd=project_root,
+        mcp_servers={"email": EMAIL_MCP_SERVER},
+        allowed_tools=ALLOWED_TOOLS,
+        permission_mode="bypassPermissions",
+        system_prompt=SYSTEM_PROMPT,
+        max_turns=max_turns,
+        # Windows fix: claude.cmd breaks on usernames with parentheses.
+        # claude_run.bat calls node.exe + cli.js directly (safe path).
+        cli_path=CLAUDE_CLI_PATH,
+        # Clear CLAUDECODE so the subprocess doesn't detect a nested session.
+        env={"CLAUDECODE": ""},
+    )
 
-    client = anthropic.AsyncAnthropic()
-    messages = [{"role": "user", "content": prompt}]
-    tools_used: List[str] = []
+    client = ClaudeSDKClient(options=options)
     response_text = ""
+    tools_used: List[str] = []
+    turns = 0
+    cost  = 0.0
 
-    for turn in range(max_turns):
-        logger.info(f"Turn {turn + 1}")
-        resp = await client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1024,
-            system="You are a helpful AI agent. Use the available tools to complete the user's request.",
-            messages=messages,
-            tools=tools,
-        )
+    logger.info("[AGENT] Connecting...")
+    await client.__aenter__()
 
-        if resp.stop_reason == "end_turn":
-            response_text = "".join(b.text for b in resp.content if hasattr(b, "text"))
-            break
+    try:
+        logger.info(f"[AGENT] Query: {prompt[:120]}")
+        await client.query(prompt)
 
-        if resp.stop_reason == "tool_use":
-            tool_results = []
-            for block in resp.content:
-                if block.type == "tool_use":
-                    tools_used.append(block.name)
-                    logger.info(f"Tool call: {block.name} | args={block.input}")
-                    result = _call_tool(block.name, block.input)
-                    logger.info(f"Tool result: {result}")
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-            messages.append({"role": "assistant", "content": resp.content})
-            messages.append({"role": "user", "content": tool_results})
+        async for message in client.receive_response():
 
-    return {"response": response_text, "tools_used": tools_used, "turns": turn + 1}
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        response_text += block.text
+                        logger.info(f"[AGENT] Text: {block.text[:100]}")
+                    elif isinstance(block, ThinkingBlock):
+                        logger.info(f"[AGENT] Thinking: {block.thinking[:80]}")
+                    elif isinstance(block, ToolUseBlock):
+                        tools_used.append(block.name)
+                        logger.info(f"[AGENT] Tool call: {block.name} | {block.input}")
+                    elif isinstance(block, ToolResultBlock):
+                        logger.info(f"[AGENT] Tool result: {block.content}")
+
+            elif isinstance(message, ResultMessage):
+                turns = message.num_turns
+                cost  = message.total_cost_usd or 0.0
+                logger.info(f"[AGENT] Done — turns={turns}, cost=${cost:.4f}")
+
+    finally:
+        logger.info("[AGENT] Closing...")
+        await client.__aexit__(None, None, None)
+
+    return {"response": response_text, "tools_used": tools_used, "turns": turns, "cost_usd": cost}
