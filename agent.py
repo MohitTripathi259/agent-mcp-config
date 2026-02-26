@@ -38,12 +38,7 @@ logger = logging.getLogger("AGENT")
 
 project_root = str(Path(__file__).parent)
 
-SYSTEM_PROMPT = (
-    "You are a helpful AI assistant with access to various tools. "
-    "Use them when needed to fulfil the user's request. "
-    "When calling email tools, always use EXACTLY the email addresses specified by the user. "
-    "Never substitute, change, or default to any other email address."
-)
+SYSTEM_PROMPT = "You are a helpful AI assistant with access to various tools. Use them when needed to fulfil the user's request."
 
 
 def _load_settings() -> dict:
