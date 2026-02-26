@@ -11,7 +11,7 @@ Flow: run_agent(prompt)
         → ClaudeAgentOptions
         → query()
         → bundled claude.exe subprocess (--print mode)
-        → MCP tool call (via HTTP → App Runner → SES)
+        → MCP tool call (stdio email_mcp_server.py → App Runner → SES)
 """
 
 import json
@@ -70,7 +70,7 @@ async def run_agent(
 
     options = ClaudeAgentOptions(
         cwd=project_root,
-        mcp_servers=_mcp_servers(settings),
+        mcp_servers=_mcp_servers(settings),   # passes stdio config as --mcp-config
         allowed_tools=_allowed_tools(settings),
         permission_mode="bypassPermissions",
         system_prompt=SYSTEM_PROMPT,
