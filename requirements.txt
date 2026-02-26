@@ -1,0 +1,8 @@
+# Core
+claude-agent-sdk>=0.1.10
+python-dotenv>=1.0.0
+
+# FastAPI and WebSocket
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0

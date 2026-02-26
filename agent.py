@@ -1,32 +1,30 @@
 """
 agent.py
 --------
-Email agent using ClaudeAgentOptions + ClaudeSDKClient (SDK MCP server pattern).
+Email agent using ClaudeAgentOptions + query().
 
-The send_email tool runs in-process via create_sdk_mcp_server(), which calls
-the App Runner HTTP endpoint. This matches the pattern used in other agents
-(CI-agent, scout-lambda) and avoids Claude CLI's HTTP MCP transport issues.
+Uses the one-shot query() function (non-streaming) so the prompt is passed
+directly via --print, bypassing the streaming-mode initialize handshake.
+
+The send_email tool is registered via mcp_servers= (passed as --mcp-config).
 
 Flow: run_agent(prompt)
-        → ClaudeAgentOptions (sdk MCP server in-process)
-        → ClaudeSDKClient
-        → Claude CLI subprocess
-        → mcp__email__send_email tool
-        → App Runner HTTP → SES → Email
+        → ClaudeAgentOptions (mcp_servers with HTTP endpoint)
+        → query()
+        → bundled claude.exe subprocess (--print mode)
+        → mcp__email__send_email tool (via HTTP → App Runner → SES)
 """
 
-import sys
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from claude_agent_sdk import (
-    ClaudeSDKClient,
+    query,
     ClaudeAgentOptions,
     AssistantMessage,
     TextBlock,
@@ -34,123 +32,100 @@ from claude_agent_sdk import (
     ToolUseBlock,
     ToolResultBlock,
     ResultMessage,
-    tool,
-    create_sdk_mcp_server,
 )
 
 logger = logging.getLogger("AGENT")
 
-# ── Constants ────────────────────────────────────────────────────────────────
+project_root = str(Path(__file__).parent)
 
-project_root    = str(Path(__file__).parent)
-MCP_SERVER_URL  = "https://hm7z9pivmn.us-west-2.awsapprunner.com"
-CLAUDE_CLI_PATH = r"C:\Users\Public\claude_run.bat"   # Windows: bypasses claude.cmd
+ALLOWED_TOOLS = ["mcp__email__send_email"]
 
-SYSTEM_PROMPT = (
-    "You are a helpful AI agent with access to an email tool. "
-    "Use the send_email tool to send emails as requested. "
-    "Always confirm success or failure clearly in your response."
-)
+# HTTP MCP server — App Runner endpoint exposing send_email via AWS SES.
+# Passed via mcp_servers= so the SDK serialises it as --mcp-config for the CLI.
+EMAIL_MCP_SERVER = {
+    "type": "http",
+    "url": "https://hm7z9pivmn.us-west-2.awsapprunner.com",
+}
 
+SYSTEM_PROMPT = """
+You are an intelligent AI email assistant.
 
-# ── In-process MCP tool ──────────────────────────────────────────────────────
+## Your Capabilities
 
-@tool(
-    name="send_email",
-    description=(
-        "Send an email via SES. Both to_email and from_email must be "
-        "SES-verified addresses."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "to_email":   {"type": "string", "description": "Recipient (SES-verified)"},
-            "from_email": {"type": "string", "description": "Sender (SES-verified)"},
-            "subject":    {"type": "string", "description": "Email subject"},
-            "content":    {"type": "string", "description": "Email body (HTML supported)"},
-        },
-        "required": ["to_email", "from_email", "subject", "content"],
-    },
-)
-async def send_email(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Call the App Runner MCP HTTP endpoint to send an email via SES."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(MCP_SERVER_URL, json={
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {"name": "send_email", "arguments": args},
-            "id": 1,
-        })
-        resp.raise_for_status()
-        content = resp.json().get("result", {}).get("content", [])
-        text = content[0].get("text", str(content)) if content else "done"
-    return {"content": [{"type": "text", "text": text}]}
+You have access to an email tool for sending emails via AWS SES.
+
+## Available MCP Tools
+
+- **send_email**: Send an email via SES. Requires to_email, from_email, subject, and content.
+  Both to_email and from_email must be SES-verified addresses.
+
+## How to Process Requests
+
+1. Extract recipient (to_email), sender (from_email), subject, and content from the user's request
+2. Use the send_email tool with all four required fields
+3. Confirm success or failure clearly in your response
+
+## Response Format
+
+Always respond with a clear confirmation, for example:
+- "Email sent successfully to <to_email> with subject '<subject>'."
+- "Failed to send email: <reason>"
+
+## Important Guidelines
+
+- Both to_email and from_email must be SES-verified addresses
+- Default from_email: karrisindhuja26@gmail.com
+- Default to_email: Mohit.Tripathi@quadranttechnologies.com
+- Always confirm the result of the email operation clearly
+"""
 
 
-EMAIL_MCP_SERVER = create_sdk_mcp_server(name="email", tools=[send_email])
-ALLOWED_TOOLS    = ["mcp__email__send_email"]
-
-
-# ── Agent runner ─────────────────────────────────────────────────────────────
-
-async def run_agent(prompt: str, max_turns: int = 10) -> Dict[str, Any]:
-    """
-    Run the agent using ClaudeAgentOptions + ClaudeSDKClient.
-
-    Pattern mirrors other agents in this codebase (CI-agent, scout-lambda):
-      1. Build ClaudeAgentOptions with in-process SDK MCP server
-      2. Create ClaudeSDKClient
-      3. connect → query → stream response
-    """
+async def run_agent(
+    prompt: str,
+    max_turns: int = 10,
+    callback: Optional[Callable[[str, str], Coroutine]] = None,
+) -> Dict[str, Any]:
     options = ClaudeAgentOptions(
         cwd=project_root,
-        mcp_servers={"email": EMAIL_MCP_SERVER},
+        setting_sources=["project"],
         allowed_tools=ALLOWED_TOOLS,
+        mcp_servers={"email": EMAIL_MCP_SERVER},
         permission_mode="bypassPermissions",
         system_prompt=SYSTEM_PROMPT,
         max_turns=max_turns,
-        # Windows fix: claude.cmd breaks on usernames with parentheses.
-        # claude_run.bat calls node.exe + cli.js directly (safe path).
-        cli_path=CLAUDE_CLI_PATH,
+        max_thinking_tokens=10000,
+        # SDK auto-discovers the bundled claude.exe (no cli_path needed).
         # Clear CLAUDECODE so the subprocess doesn't detect a nested session.
         env={"CLAUDECODE": ""},
     )
 
-    client = ClaudeSDKClient(options=options)
     response_text = ""
     tools_used: List[str] = []
     turns = 0
     cost  = 0.0
 
-    logger.info("[AGENT] Connecting...")
-    await client.__aenter__()
+    logger.info(f"[AGENT] Query: {prompt[:120]}")
 
-    try:
-        logger.info(f"[AGENT] Query: {prompt[:120]}")
-        await client.query(prompt)
+    async for message in query(prompt=prompt, options=options):
 
-        async for message in client.receive_response():
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    response_text += block.text
+                    logger.info(f"[AGENT] Text: {block.text[:100]}")
+                elif isinstance(block, ThinkingBlock):
+                    logger.info(f"[AGENT] Thinking: {block.thinking[:80]}")
+                elif isinstance(block, ToolUseBlock):
+                    tools_used.append(block.name)
+                    logger.info(f"[AGENT] Tool call: {block.name} | {block.input}")
+                    if callback:
+                        await callback(f"Calling {block.name}", "📧")
+                elif isinstance(block, ToolResultBlock):
+                    logger.info(f"[AGENT] Tool result: {block.content}")
 
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response_text += block.text
-                        logger.info(f"[AGENT] Text: {block.text[:100]}")
-                    elif isinstance(block, ThinkingBlock):
-                        logger.info(f"[AGENT] Thinking: {block.thinking[:80]}")
-                    elif isinstance(block, ToolUseBlock):
-                        tools_used.append(block.name)
-                        logger.info(f"[AGENT] Tool call: {block.name} | {block.input}")
-                    elif isinstance(block, ToolResultBlock):
-                        logger.info(f"[AGENT] Tool result: {block.content}")
-
-            elif isinstance(message, ResultMessage):
-                turns = message.num_turns
-                cost  = message.total_cost_usd or 0.0
-                logger.info(f"[AGENT] Done — turns={turns}, cost=${cost:.4f}")
-
-    finally:
-        logger.info("[AGENT] Closing...")
-        await client.__aexit__(None, None, None)
+        elif isinstance(message, ResultMessage):
+            turns = message.num_turns
+            cost  = message.total_cost_usd or 0.0
+            logger.info(f"[AGENT] Done — turns={turns}, cost=${cost:.4f}")
 
     return {"response": response_text, "tools_used": tools_used, "turns": turns, "cost_usd": cost}
