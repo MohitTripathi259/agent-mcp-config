@@ -4,7 +4,7 @@ main.py
 FastAPI server with REST and WebSocket endpoints.
 
 Start:
-    uvicorn main:app --reload --port 8003
+    uvicorn main:app --reload --port 8004
 
 Endpoints:
     GET  /           → service info
