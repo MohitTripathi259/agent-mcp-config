@@ -9,7 +9,9 @@ POST /query  (or WS /ws)
     → main.py  (FastAPI)
         → agent.py  (reads .claude/settings.json → ClaudeAgentOptions)
             → bundled claude.exe subprocess  (--print mode, no streaming)
-                → HTTP MCP call  →  App Runner  →  AWS SES  →  Email
+                → HTTP MCP call  →  App Runner (email_mcp_lambda.py)
+                                 →  AWS Lambda (sendEmailAlert)
+                                 →  AWS SES  →  Email
 ```
 
 ## Files
@@ -18,6 +20,8 @@ POST /query  (or WS /ws)
 |------|---------|
 | `main.py` | FastAPI server — REST (`/query`) + WebSocket (`/ws`) |
 | `agent.py` | Reads `settings.json`, builds `ClaudeAgentOptions`, runs `query()` |
+| `email_mcp_lambda.py` | HTTP MCP server deployed on AWS App Runner — bridges agent to SES Lambda |
+| `test_local.py` | Windows-friendly test script using Anthropic API directly (bypasses subprocess) |
 | `.claude/settings.json` | **Single source of truth** — defines all MCP servers |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable template |
@@ -97,9 +101,16 @@ ws.send(JSON.stringify({ prompt: "Send an email to ..." }));
 // receives: start → reasoning → response → done
 ```
 
+**Windows local test (no uvicorn needed):**
+```bash
+python test_local.py "Send an email to Mohit.Tripathi@quadranttechnologies.com from karrisindhuja26@gmail.com with subject Hello and content Test message"
+```
+
 ## MCP Server (App Runner)
 
 Deployed at `https://hm7z9pivmn.us-west-2.awsapprunner.com`
+
+Source: `email_mcp_lambda.py`
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -110,6 +121,23 @@ Deployed at `https://hm7z9pivmn.us-west-2.awsapprunner.com`
 
 | Tool | Parameters |
 |------|-----------|
-| `send_email` | `to_email`, `from_email`, `subject`, `content` |
+| `send_email` | `to_email`, `from_email`, `subject`, `content`, `cc` (optional array) |
 
-Both `to_email` and `from_email` must be SES-verified addresses.
+## SES Sender Requirements
+
+The `from_email` address must be **SES-verified**. Two ways:
+
+- **Individual address** (e.g. `user@gmail.com`): verify via SES console — simple, works immediately
+- **Domain** (e.g. `example.com`): add a TXT verification record + 3 DKIM CNAME records to DNS
+
+> **Corporate domains (Office 365 / Exchange)**: If the domain SPF uses `-all` and does not include `amazonses.com`, SES emails will be silently dropped by the receiving mail server even though SES reports success (0 bounces). Fix: add `include:amazonses.com` to the SPF record and add the 3 DKIM CNAME records from SES to your DNS. Contact your IT/DNS admin to apply these.
+
+## Lambda Change (sendEmailAlert)
+
+The `sendEmailAlert` Lambda previously ignored the `from_email` in the request body and always used the `FROM_EMAIL` environment variable. The following fix was applied so the caller controls the sender address:
+
+```python
+# After parsing body:
+if body.get("from_email"):
+    from_email = body["from_email"]   # caller-supplied address takes precedence
+```
