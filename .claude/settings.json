@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "email": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["email_mcp_server.py"],
+      "type": "http",
+      "url": "https://hm7z9pivmn.us-west-2.awsapprunner.com",
       "description": "Email tool — sends emails via AWS SES. Exposes send_email(to_email, from_email, subject, content). Both addresses must be SES-verified."
     }
   }

@@ -3,15 +3,15 @@ agent.py
 --------
 Email agent using ClaudeAgentOptions + query().
 
-MCP servers and allowed tools are loaded from .claude/settings.json —
-nothing tool-specific is hardcoded here.
+MCP servers are defined in .claude/settings.json — nothing is hardcoded here.
+To add a new tool: deploy an HTTP MCP server and add it to settings.json.
 
 Flow: run_agent(prompt)
         → load mcp_servers from .claude/settings.json
-        → ClaudeAgentOptions
+        → ClaudeAgentOptions(mcp_servers=...)   # passed as --mcp-config to CLI
         → query()
         → bundled claude.exe subprocess (--print mode)
-        → MCP tool call (stdio email_mcp_server.py → App Runner → SES)
+        → HTTP MCP call to App Runner → AWS SES
 """
 
 import json
@@ -70,7 +70,7 @@ async def run_agent(
 
     options = ClaudeAgentOptions(
         cwd=project_root,
-        mcp_servers=_mcp_servers(settings),   # passes stdio config as --mcp-config
+        mcp_servers=_mcp_servers(settings),    # HTTP MCP servers from settings.json
         allowed_tools=_allowed_tools(settings),
         permission_mode="bypassPermissions",
         system_prompt=SYSTEM_PROMPT,
