@@ -9,9 +9,7 @@ POST /query  (or WS /ws)
     → main.py  (FastAPI)
         → agent.py  (reads .claude/settings.json → ClaudeAgentOptions)
             → bundled claude.exe subprocess  (--print mode, no streaming)
-                → HTTP MCP call  →  App Runner (email_mcp_lambda.py)
-                                 →  AWS Lambda (sendEmailAlert)
-                                 →  AWS SES  →  Email
+                → HTTP MCP call  →  App Runner  →  AWS Lambda (sendEmailAlert)  →  AWS SES  →  Email
 ```
 
 ## Files
@@ -20,8 +18,6 @@ POST /query  (or WS /ws)
 |------|---------|
 | `main.py` | FastAPI server — REST (`/query`) + WebSocket (`/ws`) |
 | `agent.py` | Reads `settings.json`, builds `ClaudeAgentOptions`, runs `query()` |
-| `email_mcp_lambda.py` | HTTP MCP server deployed on AWS App Runner — bridges agent to SES Lambda |
-| `test_local.py` | Windows-friendly test script using Anthropic API directly (bypasses subprocess) |
 | `.claude/settings.json` | **Single source of truth** — defines all MCP servers |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable template |
@@ -101,16 +97,9 @@ ws.send(JSON.stringify({ prompt: "Send an email to ..." }));
 // receives: start → reasoning → response → done
 ```
 
-**Windows local test (no uvicorn needed):**
-```bash
-python test_local.py "Send an email to Mohit.Tripathi@quadranttechnologies.com from karrisindhuja26@gmail.com with subject Hello and content Test message"
-```
-
 ## MCP Server (App Runner)
 
 Deployed at `https://hm7z9pivmn.us-west-2.awsapprunner.com`
-
-Source: `email_mcp_lambda.py`
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
