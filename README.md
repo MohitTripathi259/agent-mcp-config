@@ -18,6 +18,7 @@ POST /query  (or WS /ws)
 |------|---------|
 | `main.py` | FastAPI server — REST (`/query`) + WebSocket (`/ws`) |
 | `agent.py` | Reads `settings.json`, builds `ClaudeAgentOptions`, runs `query()` |
+| `email_mcp_lambda.py` | HTTP MCP server (FastAPI/JSON-RPC 2.0) — deployed on AWS App Runner |
 | `.claude/settings.json` | **Single source of truth** — defines all MCP servers |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable template |
